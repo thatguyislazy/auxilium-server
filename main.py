@@ -3,9 +3,13 @@ import json
 import re
 import time
 import tempfile
+import subprocess
+import base64
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from google import genai
+from google.genai import types
 
 # --- Config ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -16,13 +20,16 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # FastAPI app
 app = FastAPI(title="Auxilium ASL Recognition Server")
 
+# Number of keyframes to extract from video
+NUM_KEYFRAMES = 8
+
 
 @app.get("/")
 async def root():
     return {
         "status": "running",
         "model": "gemini-2.5-flash",
-        "mode": "AI-powered ASL recognition",
+        "mode": "AI-powered ASL recognition (keyframe analysis)",
     }
 
 
@@ -33,7 +40,7 @@ async def health():
 
 @app.post("/predict")
 async def predict(video: UploadFile = File(...)):
-    """Receive a video clip, send to Gemini for ASL recognition."""
+    """Receive a video clip, extract keyframes, send to Gemini for ASL recognition."""
     try:
         video_bytes = await video.read()
         print(f"\n{'='*50}")
@@ -54,123 +61,240 @@ async def predict(video: UploadFile = File(...)):
 
 
 # =============================================================
-# IMPROVED ASL PROMPT
+# KEYFRAME EXTRACTION
 #
-# Key changes from the old prompt:
-#
-# 1. TEMPORAL ANALYSIS: Tells Gemini to analyze the video
-#    frame-by-frame and track how hands MOVE over time.
-#    This is critical for motion-heavy signs like AFTER,
-#    BEFORE, AGAIN, FINISH, etc. that look similar in a
-#    single frame but differ in movement direction.
-#
-# 2. SIGN COMPONENTS: Breaks down ASL signs into the 5
-#    linguistic parameters (handshape, location, movement,
-#    orientation, non-manual markers). This forces Gemini
-#    to analyze each component instead of just guessing
-#    from overall appearance.
-#
-# 3. COMMON CONFUSION PAIRS: Lists signs that look similar
-#    and tells Gemini how to distinguish them. This directly
-#    fixes the AFTER→ME misidentification.
-#
-# 4. STRICTER OUTPUT FORMAT: Reduces hallucination by being
-#    very explicit about the JSON format.
+# Instead of sending the raw video to Gemini (which it analyzes
+# poorly for ASL), we extract N evenly-spaced keyframes and
+# send them as a numbered image sequence. This lets Gemini:
+#   1. See each frame clearly (no video compression artifacts)
+#   2. Compare frames side-by-side to track motion
+#   3. Focus on hand shape changes between frames
 # =============================================================
 
-ASL_PROMPT = """You are a certified ASL (American Sign Language) interpreter with expertise in identifying signs from video recordings.
+def extract_keyframes(video_path: str, num_frames: int = NUM_KEYFRAMES) -> list:
+    """Extract evenly-spaced keyframes from video using ffmpeg."""
 
-TASK: Watch this video carefully from start to finish and identify the ASL sign being performed.
+    temp_dir = tempfile.mkdtemp()
 
-CRITICAL ANALYSIS STEPS — follow these in order:
+    try:
+        # Use ffmpeg to extract frames
+        # -vf fps=N extracts N frames per second; instead we use select filter
+        # for evenly spaced frames
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", video_path,
+                "-vf", f"select='not(mod(n\\,max(1\\,int(ceil(t_total/{num_frames})))))',setpts=N/FRAME_RATE/TB",
+                "-frames:v", str(num_frames),
+                "-q:v", "2",  # High quality JPEG
+                f"{temp_dir}/frame_%02d.jpg",
+                "-y",  # Overwrite
+            ],
+            capture_output=True, text=True, timeout=30
+        )
 
-STEP 1 - TEMPORAL MOTION ANALYSIS (most important):
-- Watch the ENTIRE video from first frame to last frame
-- Track how the hands MOVE over time — direction, speed, repetition
-- Note the STARTING position and ENDING position of each hand
-- Movement direction is often what distinguishes similar signs
+        # If ffmpeg select filter fails, use simpler approach
+        frames = sorted(Path(temp_dir).glob("frame_*.jpg"))
 
-STEP 2 - HAND SHAPE ANALYSIS:
-- Identify the handshape(s) used (flat hand, fist, pointed finger, etc.)
-- Note if handshape changes during the sign
-- Check both dominant and non-dominant hand
+        if len(frames) < 2:
+            # Fallback: use thumbnail filter
+            subprocess.run(
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-vf", f"thumbnail={num_frames},setpts=N/FRAME_RATE/TB",
+                    "-frames:v", str(num_frames),
+                    "-q:v", "2",
+                    f"{temp_dir}/frame_%02d.jpg",
+                    "-y",
+                ],
+                capture_output=True, text=True, timeout=30
+            )
+            frames = sorted(Path(temp_dir).glob("frame_*.jpg"))
 
-STEP 3 - LOCATION & CONTACT:
-- Where are the hands relative to the body? (face, chest, waist, neutral space)
-- Do the hands touch each other? Touch the body?
-- What is the contact point?
+        if len(frames) < 2:
+            # Final fallback: extract all frames and pick evenly spaced ones
+            subprocess.run(
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-q:v", "2",
+                    f"{temp_dir}/all_%04d.jpg",
+                    "-y",
+                ],
+                capture_output=True, text=True, timeout=30
+            )
+            all_frames = sorted(Path(temp_dir).glob("all_*.jpg"))
+            if len(all_frames) > 0:
+                step = max(1, len(all_frames) // num_frames)
+                frames = all_frames[::step][:num_frames]
 
-STEP 4 - ORIENTATION:
-- Which direction do the palms face? (up, down, inward, outward)
-- Does palm orientation change during the sign?
+        print(f">>> Extracted {len(frames)} keyframes")
+        return [str(f) for f in frames]
 
-STEP 5 - NON-MANUAL MARKERS:
-- Check facial expression (raised eyebrows, mouth shape, head tilt)
-- These can change the meaning entirely
+    except Exception as e:
+        print(f"!!! Frame extraction error: {e}")
+        return []
 
-COMMON CONFUSION PAIRS — pay special attention:
-- AFTER vs ME: "AFTER" = flat hand moves FORWARD off the back of the other hand. "ME" = pointing to self/chest with index finger.
-- BEFORE vs AFTER: Direction of movement is opposite
-- HELP vs THANK-YOU: Both involve flat hand near chin, but movement differs
-- WANT vs FREEZE: Similar handshape but different location and movement
-- LIKE vs FAVORITE: Similar but FAVORITE touches chin
-- UNDERSTAND vs KNOW: Location on forehead differs
-- SORRY vs PLEASE: Both circular on chest, but handshape differs (fist vs flat)
-- AGAIN vs REPEAT: Similar but AGAIN uses bent hand into flat palm
-- HELLO vs GOODBYE: Wave direction and palm orientation differ
-- YES vs NO: Fist nodding vs two fingers closing
 
-OUTPUT FORMAT — respond with ONLY this JSON, no markdown, no backticks, no explanation outside the JSON:
-{"prediction": "WORD", "confidence": 0.85, "explanation": "I observed [specific hand movements/shapes/positions]. The dominant hand [does what] while the non-dominant hand [does what]. The movement goes [direction].", "top3": [{"label": "WORD1", "confidence": 0.85}, {"label": "WORD2", "confidence": 0.10}, {"label": "WORD3", "confidence": 0.05}]}
+def extract_keyframes_opencv(video_path: str, num_frames: int = NUM_KEYFRAMES) -> list:
+    """Fallback: Extract keyframes using OpenCV if ffmpeg is unavailable."""
+    try:
+        import cv2
+    except ImportError:
+        print("!!! OpenCV not available")
+        return []
 
-Rules:
-- "prediction" = the English word in UPPERCASE
-- "confidence" = number between 0.0 and 1.0
-- "explanation" = describe exactly what you SEE the hands doing (movement, shape, location)
-- "top3" = three most likely signs with confidence scores that sum to ~1.0
-- If unsure, lower your confidence score but still give your best guess
-- Do NOT default to simple signs like "ME", "HELLO", "YES" unless you are truly confident"""
+    temp_dir = tempfile.mkdtemp()
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total < 2:
+        cap.release()
+        return []
+
+    frames = []
+    for i in range(num_frames):
+        idx = int(i * (total - 1) / (num_frames - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            path = f"{temp_dir}/frame_{i:02d}.jpg"
+            cv2.imwrite(path, frame)
+            frames.append(path)
+
+    cap.release()
+    print(f">>> Extracted {len(frames)} keyframes (OpenCV)")
+    return frames
+
+
+# =============================================================
+# ASL ANALYSIS PROMPT — optimized for image sequence input
+# =============================================================
+
+ASL_PROMPT_SEQUENCE = """You are a certified ASL (American Sign Language) interpreter.
+
+I am showing you {num_frames} keyframes extracted from a video of someone performing a SINGLE ASL sign. The frames are in chronological order (Frame 1 = start, Frame {num_frames} = end).
+
+YOUR TASK: Identify the ASL sign being performed by analyzing how the hands change across all frames.
+
+ANALYSIS METHOD:
+1. COMPARE Frame 1 vs Frame {num_frames}: Where did the hands START and where did they END?
+2. TRACK the motion path: What direction did the hands move? (up/down/left/right/forward/backward/circular)
+3. IDENTIFY the handshape: What shape are the hands in? Does it change between frames?
+4. NOTE hand relationship: Do the hands touch? Does one hand move relative to the other (which stays still)?
+5. CHECK location: Where are the hands relative to the body?
+
+CRITICAL — MOTION IS KEY:
+Many ASL signs look identical in a single frame but differ in movement:
+- AFTER: Non-dominant flat hand stays still, dominant flat hand slides FORWARD off its back
+- BEFORE: Opposite direction of AFTER — hand moves BACKWARD toward body
+- CLEAN: One flat hand wipes across the other palm (horizontal wiping motion)
+- ME: Index finger points at own chest (minimal movement)
+- HELP: Fist on flat palm, both move UP together
+- THANK YOU: Flat hand at chin moves FORWARD and DOWN
+- SORRY: Fist circles on chest
+- PLEASE: Flat hand circles on chest
+- AGAIN: Bent hand arcs into flat upward palm
+- WANT: Both claw hands pull TOWARD body
+- LIKE: Thumb and middle finger on chest, pull away while pinching
+- KNOW: Fingers tap forehead/temple
+- UNDERSTAND: Index finger flicks UP near forehead
+- FINISH/DONE: Both 5-hands flip outward quickly
+- HELLO: Hand waves away from forehead (like a salute opening up)
+- GOOD: Flat hand at chin moves down to other flat hand
+- BAD: Flat hand at chin flips down and away
+- EAT/FOOD: Fingertips tap mouth
+- DRINK: C-hand tips toward mouth
+- MORE: Both flat-O hands tap fingertips together
+- DIFFERENT: Two index fingers crossed then pull apart
+- SAME: Both index fingers side by side move together
+
+Respond with ONLY this JSON (no markdown, no backticks):
+{{"prediction": "WORD", "confidence": 0.85, "explanation": "Starting position: [describe]. Ending position: [describe]. Motion: [describe direction/path]. Handshape: [describe]. This matches the ASL sign for WORD.", "top3": [{{"label": "WORD1", "confidence": 0.85}}, {{"label": "WORD2", "confidence": 0.10}}, {{"label": "WORD3", "confidence": 0.05}}]}}"""
+
+
+# Fallback: send raw video file (if keyframe extraction fails)
+ASL_PROMPT_VIDEO = """You are a certified ASL interpreter. Watch this video and identify the ASL sign.
+
+CRITICAL: Track hand MOVEMENT from start to end. Movement direction distinguishes similar signs:
+- AFTER = flat hand slides FORWARD off back of other hand
+- CLEAN = hand wipes ACROSS the other palm  
+- ME = index finger points at chest (minimal movement)
+- BEFORE = hand moves BACKWARD toward body
+
+List the 5 ASL parameters you observe:
+1. Handshape (flat, fist, claw, pointed, etc.)
+2. Location (face, chest, neutral space, etc.)  
+3. Movement (direction, path, repetition)
+4. Palm orientation (up, down, in, out)
+5. Non-manual (facial expression)
+
+Respond with ONLY JSON (no markdown):
+{"prediction": "WORD", "confidence": 0.85, "explanation": "description of what hands do", "top3": [{"label": "W1", "confidence": 0.85}, {"label": "W2", "confidence": 0.10}, {"label": "W3", "confidence": 0.05}]}"""
 
 
 def analyze_asl_video(video_bytes):
-    """Send video to Gemini for ASL recognition."""
+    """Extract keyframes and send to Gemini for ASL recognition."""
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
         temp_path = f.name
 
     try:
-        # Upload file to Gemini
-        print(">>> Uploading video to Gemini...")
-        uploaded_file = client.files.upload(file=temp_path)
-        print(f">>> Upload complete: {uploaded_file.name}")
-
-        # Wait for processing
-        max_wait = 60  # Don't wait forever
-        waited = 0
-        while uploaded_file.state.name == "PROCESSING":
-            print(">>> Waiting for Gemini to process video...")
-            time.sleep(2)
-            waited += 2
-            if waited > max_wait:
-                return {"error": "Video processing timed out"}
-            uploaded_file = client.files.get(name=uploaded_file.name)
-
-        if uploaded_file.state.name == "FAILED":
-            return {"error": "Gemini failed to process video"}
-
-        print(f">>> File state: {uploaded_file.state.name}")
-
         # =====================================================
-        # MODEL ORDER: Try best models FIRST, fall back to lite
-        #
-        # Old order (wrong): flash-lite → flash → 2.5-lite → 2.5
-        # New order (correct): 2.5-flash → 2.0-flash → 2.5-lite → 2.0-lite
-        #
-        # The better models are MUCH more accurate at video
-        # analysis and temporal understanding. Only fall back
-        # to lite models if rate limited.
+        # STRATEGY 1: Extract keyframes and send as images
+        # This is MUCH more accurate than raw video because
+        # Gemini can compare individual frames side-by-side
         # =====================================================
+        keyframe_paths = extract_keyframes(temp_path)
+
+        if len(keyframe_paths) < 2:
+            # Try OpenCV fallback
+            keyframe_paths = extract_keyframes_opencv(temp_path)
+
+        if len(keyframe_paths) >= 2:
+            print(f">>> Using keyframe analysis ({len(keyframe_paths)} frames)")
+            return analyze_with_keyframes(keyframe_paths, len(video_bytes))
+        else:
+            # =====================================================
+            # STRATEGY 2: Fallback to raw video upload
+            # Only used if frame extraction completely fails
+            # =====================================================
+            print(">>> Keyframe extraction failed, falling back to video upload")
+            return analyze_with_video(temp_path, len(video_bytes))
+
+    except Exception as e:
+        print(f"!!! Analysis error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+    finally:
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+
+def analyze_with_keyframes(frame_paths: list, video_size: int) -> dict:
+    """Send keyframes as numbered images to Gemini."""
+
+    try:
+        # Build the content: prompt + numbered images
+        prompt = ASL_PROMPT_SEQUENCE.format(num_frames=len(frame_paths))
+
+        # Build content parts: text prompt first, then images
+        content_parts = [prompt]
+
+        for i, path in enumerate(frame_paths):
+            with open(path, "rb") as img_file:
+                img_bytes = img_file.read()
+
+            # Add frame label + image
+            content_parts.append(f"\n--- Frame {i+1} of {len(frame_paths)} ---")
+            content_parts.append(
+                types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+            )
+
+        # Try models in order (best first)
         models_to_try = [
             "gemini-2.5-flash",
             "gemini-2.0-flash",
@@ -183,10 +307,10 @@ def analyze_asl_video(video_bytes):
 
         for model_name in models_to_try:
             try:
-                print(f">>> Trying model: {model_name}")
+                print(f">>> Trying {model_name} with {len(frame_paths)} keyframes...")
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=[uploaded_file, ASL_PROMPT]
+                    contents=content_parts
                 )
                 used_model = model_name
                 print(f">>> Success with {model_name}")
@@ -203,91 +327,165 @@ def analyze_asl_video(video_bytes):
                     continue
                 else:
                     print(f">>> {model_name} error: {error_str}")
-                    continue  # Try next model instead of crashing
+                    continue
 
         if response is None:
-            # All models failed — wait and retry with the most reliable one
-            print(">>> All models failed. Waiting 30 seconds...")
+            print(">>> All models failed on keyframes. Waiting 30s...")
             time.sleep(30)
             try:
                 response = client.models.generate_content(
                     model="gemini-2.0-flash",
-                    contents=[uploaded_file, ASL_PROMPT]
+                    contents=content_parts
                 )
                 used_model = "gemini-2.0-flash (retry)"
             except Exception as e:
-                return {"error": f"All models unavailable. Try again in a minute. ({e})"}
+                return {"error": f"All models unavailable. ({e})"}
 
-        result_text = response.text.strip()
-        print(f">>> Gemini raw response: {result_text}")
+        return parse_response(response, used_model, video_size, "keyframes")
 
-        # Clean markdown fences if present
-        if result_text.startswith("```"):
-            lines = result_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            result_text = "\n".join(lines).strip()
+    finally:
+        # Clean up frame files
+        for path in frame_paths:
+            try:
+                os.unlink(path)
+            except:
+                pass
+        # Try to remove temp directory
+        if frame_paths:
+            try:
+                os.rmdir(os.path.dirname(frame_paths[0]))
+            except:
+                pass
 
-        # Parse JSON response
+
+def analyze_with_video(video_path: str, video_size: int) -> dict:
+    """Fallback: Upload raw video to Gemini."""
+
+    # Upload file
+    print(">>> Uploading video to Gemini...")
+    uploaded_file = client.files.upload(file=video_path)
+    print(f">>> Upload complete: {uploaded_file.name}")
+
+    # Wait for processing
+    max_wait = 60
+    waited = 0
+    while uploaded_file.state.name == "PROCESSING":
+        print(">>> Waiting for Gemini to process video...")
+        time.sleep(2)
+        waited += 2
+        if waited > max_wait:
+            return {"error": "Video processing timed out"}
+        uploaded_file = client.files.get(name=uploaded_file.name)
+
+    if uploaded_file.state.name == "FAILED":
+        return {"error": "Gemini failed to process video"}
+
+    # Try models
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite",
+    ]
+
+    response = None
+    used_model = "unknown"
+
+    for model_name in models_to_try:
         try:
-            result = json.loads(result_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON from mixed text
-            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    result = {
-                        "prediction": "UNKNOWN",
-                        "confidence": 0.0,
-                        "explanation": result_text,
-                        "top3": [{"label": "UNKNOWN", "confidence": 0.0}]
-                    }
+            print(f">>> Trying {model_name} with video...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[uploaded_file, ASL_PROMPT_VIDEO]
+            )
+            used_model = model_name
+            break
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                time.sleep(3)
+                continue
+            elif "503" in error_str or "UNAVAILABLE" in error_str:
+                time.sleep(2)
+                continue
             else:
+                continue
+
+    if response is None:
+        time.sleep(30)
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[uploaded_file, ASL_PROMPT_VIDEO]
+            )
+            used_model = "gemini-2.0-flash (retry)"
+        except Exception as e:
+            return {"error": f"All models unavailable. ({e})"}
+
+    # Clean up
+    try:
+        client.files.delete(name=uploaded_file.name)
+    except:
+        pass
+
+    return parse_response(response, used_model, video_size, "video")
+
+
+def parse_response(response, used_model: str, video_size: int, method: str) -> dict:
+    """Parse Gemini response into standardized result."""
+
+    result_text = response.text.strip()
+    print(f">>> Gemini raw response: {result_text}")
+
+    # Clean markdown fences
+    if result_text.startswith("```"):
+        lines = result_text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        result_text = "\n".join(lines).strip()
+
+    # Parse JSON
+    try:
+        result = json.loads(result_text)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            try:
+                result = json.loads(json_match.group())
+            except json.JSONDecodeError:
                 result = {
                     "prediction": "UNKNOWN",
                     "confidence": 0.0,
                     "explanation": result_text,
                     "top3": [{"label": "UNKNOWN", "confidence": 0.0}]
                 }
-
-        # Ensure all required fields exist
-        if "top3" not in result:
-            result["top3"] = [{"label": result.get("prediction", "UNKNOWN"),
-                               "confidence": result.get("confidence", 0.0)}]
-
-        prediction = result.get("prediction", "UNKNOWN").upper()
-        confidence = min(1.0, max(0.0, float(result.get("confidence", 0.0))))
-
-        print(f">>> Prediction: {prediction} ({confidence*100:.1f}%)")
-        print(f">>> Explanation: {result.get('explanation', 'N/A')}")
-        print(f">>> Top 3: {result.get('top3', [])}")
-
-        # Clean up uploaded file from Gemini
-        try:
-            client.files.delete(name=uploaded_file.name)
-        except:
-            pass
-
-        return {
-            "prediction": prediction,
-            "confidence": confidence,
-            "top3": result.get("top3", []),
-            "explanation": result.get("explanation", ""),
-            "debug": {
-                "model": used_model,
-                "video_size": len(video_bytes),
+        else:
+            result = {
+                "prediction": "UNKNOWN",
+                "confidence": 0.0,
+                "explanation": result_text,
+                "top3": [{"label": "UNKNOWN", "confidence": 0.0}]
             }
+
+    # Ensure required fields
+    if "top3" not in result:
+        result["top3"] = [{"label": result.get("prediction", "UNKNOWN"),
+                           "confidence": result.get("confidence", 0.0)}]
+
+    prediction = result.get("prediction", "UNKNOWN").upper()
+    confidence = min(1.0, max(0.0, float(result.get("confidence", 0.0))))
+
+    print(f">>> Prediction: {prediction} ({confidence*100:.1f}%)")
+    print(f">>> Explanation: {result.get('explanation', 'N/A')}")
+    print(f">>> Method: {method}")
+
+    return {
+        "prediction": prediction,
+        "confidence": confidence,
+        "top3": result.get("top3", []),
+        "explanation": result.get("explanation", ""),
+        "debug": {
+            "model": used_model,
+            "method": method,
+            "video_size": video_size,
         }
-
-    except Exception as e:
-        print(f"!!! Gemini error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
-
-    finally:
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
+    }
