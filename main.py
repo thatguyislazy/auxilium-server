@@ -166,69 +166,50 @@ def extract_keyframes_opencv(video_path: str, num_frames: int = NUM_KEYFRAMES) -
 
 
 # =============================================================
-# ASL ANALYSIS PROMPT — optimized for image sequence input
+# ASL ANALYSIS PROMPTS
+#
+# Based on Gemini's own recommendation ("Auxilium Precision")
+# for maximum accuracy. Two versions:
+# - SEQUENCE: for keyframe image analysis (primary)
+# - VIDEO: for raw video fallback
 # =============================================================
 
-ASL_PROMPT_SEQUENCE = """You are a certified ASL (American Sign Language) interpreter.
+ASL_PROMPT_SEQUENCE = """Role: You are a certified ASL interpreter and computer vision specialist.
+Task: I am showing you {num_frames} keyframes extracted in chronological order from a video of someone performing a SINGLE ASL sign. Frame 1 is the start, Frame {num_frames} is the end. Analyze and identify the specific ASL sign being performed. Focus on identifying the sign accurately even if there is significant motion blur or fast movement.
 
-I am showing you {num_frames} keyframes extracted from a video of someone performing a SINGLE ASL sign. The frames are in chronological order (Frame 1 = start, Frame {num_frames} = end).
+Instructions: Analyze the frames and determine:
 
-YOUR TASK: Identify the ASL sign being performed by analyzing how the hands change across all frames.
+1. Initial Handshape: Describe the handshape of the dominant and non-dominant hands in Frame 1 (e.g., Flat-B, Open-A, 1-point, S-fist, C-shape, Claw-5, etc.).
+2. Motion Path & Velocity: By comparing Frame 1 through Frame {num_frames}, trace the movement from start to finish. Is it linear, circular, repetitive, or a single stroke? Does the hand move forward, backward, up, down, or sideways? Is the motion fast or slow?
+3. Hand Relationship: Do the hands touch? Does one slide over the other, or do they move symmetrically? Does one hand stay still while the other moves?
+4. Spatial Location: Where is the sign performed relative to the head, chest, or neutral space?
+5. Orientation: Which way are the palms facing throughout the movement? Does orientation change between frames?
+6. Potential Confusions: List signs that look similar and explain why this specific video matches one over the other based on the motion path, palm orientation, or thumb position.
 
-ANALYSIS METHOD:
-1. COMPARE Frame 1 vs Frame {num_frames}: Where did the hands START and where did they END?
-2. TRACK the motion path: What direction did the hands move? (up/down/left/right/forward/backward/circular)
-3. IDENTIFY the handshape: What shape are the hands in? Does it change between frames?
-4. NOTE hand relationship: Do the hands touch? Does one hand move relative to the other (which stays still)?
-5. CHECK location: Where are the hands relative to the body?
+Respond with ONLY this JSON (no markdown, no backticks, no other text):
+{{"prediction": "WORD", "confidence": 0.85, "explanation": "Initial handshape: [describe]. Motion: [direction/path]. Hand relationship: [describe]. This matches [WORD] because [reason], not [confused sign] because [difference].", "top3": [{{"label": "WORD1", "confidence": 0.85}}, {{"label": "WORD2", "confidence": 0.10}}, {{"label": "WORD3", "confidence": 0.05}}]}}
 
-CRITICAL — MOTION IS KEY:
-Many ASL signs look identical in a single frame but differ in movement:
-- AFTER: Non-dominant flat hand stays still, dominant flat hand slides FORWARD off its back
-- BEFORE: Opposite direction of AFTER — hand moves BACKWARD toward body
-- CLEAN: One flat hand wipes across the other palm (horizontal wiping motion)
-- ME: Index finger points at own chest (minimal movement)
-- HELP: Fist on flat palm, both move UP together
-- THANK YOU: Flat hand at chin moves FORWARD and DOWN
-- SORRY: Fist circles on chest
-- PLEASE: Flat hand circles on chest
-- AGAIN: Bent hand arcs into flat upward palm
-- WANT: Both claw hands pull TOWARD body
-- LIKE: Thumb and middle finger on chest, pull away while pinching
-- KNOW: Fingers tap forehead/temple
-- UNDERSTAND: Index finger flicks UP near forehead
-- FINISH/DONE: Both 5-hands flip outward quickly
-- HELLO: Hand waves away from forehead (like a salute opening up)
-- GOOD: Flat hand at chin moves down to other flat hand
-- BAD: Flat hand at chin flips down and away
-- EAT/FOOD: Fingertips tap mouth
-- DRINK: C-hand tips toward mouth
-- MORE: Both flat-O hands tap fingertips together
-- DIFFERENT: Two index fingers crossed then pull apart
-- SAME: Both index fingers side by side move together
-
-Respond with ONLY this JSON (no markdown, no backticks):
-{{"prediction": "WORD", "confidence": 0.85, "explanation": "Starting position: [describe]. Ending position: [describe]. Motion: [describe direction/path]. Handshape: [describe]. This matches the ASL sign for WORD.", "top3": [{{"label": "WORD1", "confidence": 0.85}}, {{"label": "WORD2", "confidence": 0.10}}, {{"label": "WORD3", "confidence": 0.05}}]}}"""
+Rules:
+- "prediction" = the English word in UPPERCASE
+- "confidence" = number between 0.0 and 1.0
+- "top3" = three most likely signs, confidences should roughly sum to 1.0
+- In "explanation", always mention what signs could be confused and why you ruled them out"""
 
 
-# Fallback: send raw video file (if keyframe extraction fails)
-ASL_PROMPT_VIDEO = """You are a certified ASL interpreter. Watch this video and identify the ASL sign.
+ASL_PROMPT_VIDEO = """Role: You are a certified ASL interpreter and computer vision specialist.
+Task: Analyze the uploaded video and identify the specific ASL sign being performed. Focus on identifying the sign accurately even if there is significant motion blur or fast movement.
 
-CRITICAL: Track hand MOVEMENT from start to end. Movement direction distinguishes similar signs:
-- AFTER = flat hand slides FORWARD off back of other hand
-- CLEAN = hand wipes ACROSS the other palm  
-- ME = index finger points at chest (minimal movement)
-- BEFORE = hand moves BACKWARD toward body
+Instructions: Analyze the video and determine:
 
-List the 5 ASL parameters you observe:
-1. Handshape (flat, fist, claw, pointed, etc.)
-2. Location (face, chest, neutral space, etc.)  
-3. Movement (direction, path, repetition)
-4. Palm orientation (up, down, in, out)
-5. Non-manual (facial expression)
+1. Initial Handshape: Describe the handshape of the dominant and non-dominant hands at the very first frame (e.g., Flat-B, Open-A, 1-point, S-fist, C-shape, etc.).
+2. Motion Path & Velocity: Trace the movement from start to finish. Is it linear, circular, repetitive, or a single stroke? Note if the motion is fast or slow. What DIRECTION does the hand move?
+3. Hand Relationship: Do the hands touch? Does one slide over the other, or do they move symmetrically? Does one stay still?
+4. Spatial Location: Where is the sign performed relative to the head, chest, or neutral space?
+5. Orientation: Which way are the palms facing throughout the movement?
+6. Potential Confusions: List signs that look similar (e.g., "After" vs "Clean", "Help" vs "Thank-you") and explain why this specific video matches one over the other based on the motion path, palm orientation, or thumb position.
 
-Respond with ONLY JSON (no markdown):
-{"prediction": "WORD", "confidence": 0.85, "explanation": "description of what hands do", "top3": [{"label": "W1", "confidence": 0.85}, {"label": "W2", "confidence": 0.10}, {"label": "W3", "confidence": 0.05}]}"""
+Respond with ONLY this JSON (no markdown, no backticks, no other text):
+{"prediction": "WORD", "confidence": 0.85, "explanation": "Initial handshape: [describe]. Motion: [direction/path]. This matches [WORD] because [reason], not [confused sign] because [difference].", "top3": [{"label": "WORD1", "confidence": 0.85}, {"label": "WORD2", "confidence": 0.10}, {"label": "WORD3", "confidence": 0.05}]}"""
 
 
 def analyze_asl_video(video_bytes):
