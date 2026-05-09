@@ -21,8 +21,8 @@ app = FastAPI(title="Auxilium ASL Recognition Server")
 async def root():
     return {
         "status": "running",
-        "model": "gemini-2.0-flash-lite",
-        "mode": "AI-powered ASL recognition",
+        "model": "gemini-2.0-flash",
+        "mode": "AI-powered ASL recognition (Optimized Precision)",
     }
 
 
@@ -54,7 +54,7 @@ async def predict(video: UploadFile = File(...)):
 
 
 def analyze_asl_video(video_bytes):
-    """Send video to Gemini for ASL recognition."""
+    """Send video to Gemini for ASL recognition using the Precision Prompt."""
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
@@ -77,33 +77,27 @@ def analyze_asl_video(video_bytes):
 
         print(f">>> File state: {uploaded_file.state.name}")
 
-        # ASL analysis prompt
-        prompt = """You are an expert ASL (American Sign Language) interpreter.
+        # REFINED AUXILIUM PRECISION PROMPT
+        prompt = """Role: You are a Senior ASL Interpreter and Computer Vision Expert.
+Task: Analyze this video carefully to identify the specific ASL sign being performed.
 
-Analyze this video carefully and identify the ASL sign being performed.
+CRITICAL ANALYSIS STEPS:
+1. Identify Anchor Points: Where is the hand relative to the body? (e.g., Chin for AGE, Chest for BIRTHDAY, Nose for BORED).
+2. Track Motion Vectors: 
+   - Y-axis: Is there a downward tug (AGE) or an upward rise (MORNING)?
+   - Z-axis: Is the hand moving toward or away from the camera (AFTER)?
+   - X-axis: Is there a side-to-side zigzag or oscillation (ART)?
+3. Compound Sign Check: Does the sign have two distinct parts? (e.g., EAT + MORNING = BREAKFAST).
+4. Hand Relationship: Is one hand acting as a base or 'canvas' (ART/AFTER)?
 
-Rules:
-1. Focus on hand shapes, hand movements, hand positions relative to the body, and facial expressions
-2. Consider both one-handed and two-handed signs
-3. Be specific - give the exact English word/phrase the sign represents
-4. If you can identify the sign, respond with ONLY a JSON object (no markdown, no backticks)
-5. If you cannot identify the sign clearly, still give your best guess
-
-Respond ONLY with this exact JSON format, nothing else:
-{"prediction": "WORD", "confidence": 0.85, "explanation": "brief description of the sign observed", "top3": [{"label": "WORD1", "confidence": 0.85}, {"label": "WORD2", "confidence": 0.10}, {"label": "WORD3", "confidence": 0.05}]}
-
-Important:
-- prediction should be the English word in UPPERCASE
-- confidence should be between 0.0 and 1.0
-- top3 should list the 3 most likely signs
-- explanation should briefly describe what hand movements/shapes you see"""
+Respond ONLY with this exact JSON format (no markdown, no backticks):
+{"prediction": "WORD", "confidence": 0.95, "explanation": "Spatial Context: [location]. Movement: [axis/path]. Distinguisher: This matches [WORD] and not [SIMILAR SIGN] because of [reason].", "top3": [{"label": "WORD1", "confidence": 0.90}, {"label": "WORD2", "confidence": 0.07}, {"label": "WORD3", "confidence": 0.03}]}"""
 
         # Try multiple models (fallback chain)
         models_to_try = [
-            "gemini-2.0-flash-lite",
             "gemini-2.0-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
+            "gemini-1.5-flash",
+            "gemini-2.0-flash-lite",
         ]
 
         response = None
@@ -120,64 +114,29 @@ Important:
                 print(f">>> Success with {model_name}")
                 break
             except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    print(f">>> Rate limited on {model_name}, trying next...")
-                    time.sleep(3)
-                    continue
-                elif "503" in error_str or "UNAVAILABLE" in error_str:
-                    print(f">>> {model_name} unavailable, trying next...")
-                    time.sleep(2)
-                    continue
-                else:
-                    raise
+                print(f"!!! {model_name} failed, trying next...")
+                continue
 
         if response is None:
-            # All models failed — wait and retry once
-            print(">>> All models failed. Waiting 30 seconds...")
-            time.sleep(30)
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash-lite",
-                    contents=[uploaded_file, prompt]
-                )
-                used_model = "gemini-2.0-flash-lite"
-            except Exception as e:
-                return {"error": f"All models rate limited. Try again in a minute. ({e})"}
+            return {"error": "All Gemini models rate limited or failed."}
 
         result_text = response.text.strip()
         print(f">>> Gemini raw response: {result_text}")
 
-        # Clean markdown
-        if result_text.startswith("```"):
-            lines = result_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            result_text = "\n".join(lines).strip()
-
-        # Parse JSON
-        try:
-            result = json.loads(result_text)
-        except json.JSONDecodeError:
-            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                result = {
-                    "prediction": "UNKNOWN",
-                    "confidence": 0.0,
-                    "explanation": result_text,
-                    "top3": [{"label": "UNKNOWN", "confidence": 0.0}]
-                }
-
-        if "top3" not in result:
-            result["top3"] = [{"label": result.get("prediction", "UNKNOWN"),
-                               "confidence": result.get("confidence", 0.0)}]
+        # Robust JSON extraction to prevent crashes
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+        else:
+            result = {
+                "prediction": "UNKNOWN",
+                "confidence": 0.0,
+                "explanation": "Invalid JSON response from AI",
+                "top3": []
+            }
 
         prediction = result.get("prediction", "UNKNOWN").upper()
         confidence = float(result.get("confidence", 0.0))
-
-        print(f">>> Prediction: {prediction} ({confidence*100:.1f}%)")
-        print(f">>> Explanation: {result.get('explanation', 'N/A')}")
 
         # Clean up uploaded file
         try:
@@ -198,8 +157,6 @@ Important:
 
     except Exception as e:
         print(f"!!! Gemini error: {e}")
-        import traceback
-        traceback.print_exc()
         return {"error": str(e)}
 
     finally:
