@@ -9,7 +9,7 @@ from google import genai
 
 # --- Config ---
 # Gamitin ang bagong key mo dito
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDQU02MBmJA93TDUm2DQUHq7-BRys0Z4Z4")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDuAo2jPiTd2PT5tpdVkR9Pg4C8zqbzo8k")
 
 # Initialize Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
