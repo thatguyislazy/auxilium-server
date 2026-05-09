@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from google import genai
 
 # --- Config ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDuAo2jPiTd2PT5tpdVkR9Pg4C8zqbzo8k")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCezZTdc114JRS-OQmChqerXChR89c-hm4")
 
 # Initialize Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
