@@ -9,14 +9,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 
-import anthropic
 from google import genai
 from google.genai import types as gemini_types
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 app = FastAPI(title="Auxilium ASL Recognition Server")
@@ -24,9 +21,6 @@ NUM_KEYFRAMES = 12
 
 # =============================================================
 # PROMPTS
-# FIX: Use single-line JSON format in prompt so the response
-# is always parseable. Multiline JSON in the example caused
-# the regex to fail and return UNKNOWN.
 # =============================================================
 
 ASL_PROMPT = """Role: Senior ASL Interpreter & Computer Vision Specialist.
@@ -68,14 +62,55 @@ IMPORTANT: Respond with ONLY a single-line JSON object. No markdown, no backtick
 
 @app.get("/")
 async def root():
-    providers = []
-    if claude_client: providers.append("claude")
-    if gemini_client: providers.append("gemini")
-    return {"status": "running", "providers": providers, "version": "2.2"}
+    return {
+        "status": "running",
+        "providers": ["gemini"] if gemini_client else [],
+        "version": "3.0"
+    }
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "providers": {"claude": bool(claude_client), "gemini": bool(gemini_client)}}
+    gemini_ok = False
+    gemini_error = None
+    if not GEMINI_API_KEY:
+        gemini_error = "GEMINI_API_KEY is not set in environment"
+    elif gemini_client:
+        try:
+            resp = gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=["Say hello in one word"]
+            )
+            gemini_ok = True
+        except Exception as e:
+            gemini_error = str(e)
+    else:
+        gemini_error = "gemini_client failed to initialize"
+
+    return {
+        "status": "ok" if gemini_ok else "degraded",
+        "providers": {
+            "gemini": gemini_ok,
+            "gemini_error": gemini_error
+        }
+    }
+
+
+@app.get("/test-gemini")
+async def test_gemini():
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY is not set in environment variables"}
+    if not gemini_client:
+        return {"error": "gemini_client failed to initialize — check API key"}
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=["Say hello in one word"]
+        )
+        return {"status": "ok", "response": resp.text}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 
 @app.post("/predict")
 async def predict(video: UploadFile = File(...)):
@@ -84,8 +119,6 @@ async def predict(video: UploadFile = File(...)):
         print(f"\n{'='*50}")
         print(f"=== RECEIVED VIDEO: {len(video_bytes)} bytes ===")
         result = analyze_asl_video(video_bytes)
-        # FIX: Always return 200 with prediction, even on partial errors
-        # Only return 500 if we have zero result at all
         if result is None:
             return JSONResponse(status_code=500, content={"error": "No result"})
         return JSONResponse(content=result)
@@ -156,6 +189,15 @@ def extract_keyframes_ffmpeg(video_path: str, num_frames: int = NUM_KEYFRAMES) -
 # =============================================================
 
 def analyze_asl_video(video_bytes: bytes) -> dict:
+    if not gemini_client:
+        return {
+            "prediction": "UNKNOWN",
+            "confidence": 0.0,
+            "explanation": "GEMINI_API_KEY is not set. Please add it in Render environment variables.",
+            "top3": [],
+            "error": "No Gemini client"
+        }
+
     keyframe_paths = []
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
@@ -164,38 +206,36 @@ def analyze_asl_video(video_bytes: bytes) -> dict:
     try:
         keyframe_paths = extract_keyframes(temp_path)
         if len(keyframe_paths) < 2:
-            return {"prediction": "UNKNOWN", "confidence": 0.0,
-                    "explanation": "Could not extract frames from video",
-                    "top3": [], "error": "Frame extraction failed"}
+            return {
+                "prediction": "UNKNOWN",
+                "confidence": 0.0,
+                "explanation": "Could not extract frames from video",
+                "top3": [],
+                "error": "Frame extraction failed"
+            }
 
         print(f">>> {len(keyframe_paths)} keyframes ready")
 
-        # 1. Claude (primary)
-        if claude_client:
-            print(">>> Trying Claude...")
-            result = analyze_with_claude(keyframe_paths, len(video_bytes))
-            if result and "prediction" in result:
-                return result
-            print(f">>> Claude failed: {result}")
+        # 1. Try Gemini keyframes first
+        print(">>> Trying Gemini keyframes...")
+        result = analyze_with_gemini_keyframes(keyframe_paths, len(video_bytes))
+        if result and "prediction" in result:
+            return result
+        print(f">>> Gemini keyframes failed: {result}")
 
-        # 2. Gemini keyframes
-        if gemini_client:
-            print(">>> Trying Gemini keyframes...")
-            result = analyze_with_gemini_keyframes(keyframe_paths, len(video_bytes))
-            if result and "prediction" in result:
-                return result
-            print(f">>> Gemini keyframes failed: {result}")
+        # 2. Fallback: Gemini video upload
+        print(">>> Trying Gemini video upload...")
+        result = analyze_with_gemini_video(temp_path, len(video_bytes))
+        if result and "prediction" in result:
+            return result
+        print(f">>> Gemini video failed: {result}")
 
-            # 3. Gemini video upload (last resort)
-            print(">>> Trying Gemini video upload...")
-            result = analyze_with_gemini_video(temp_path, len(video_bytes))
-            if result and "prediction" in result:
-                return result
-            print(f">>> Gemini video failed: {result}")
-
-        return {"prediction": "UNKNOWN", "confidence": 0.0,
-                "explanation": "All AI providers failed — check API keys and quota.",
-                "top3": []}
+        return {
+            "prediction": "UNKNOWN",
+            "confidence": 0.0,
+            "explanation": f"All Gemini methods failed. Last error: {result.get('error', 'unknown')}",
+            "top3": []
+        }
 
     finally:
         try: os.unlink(temp_path)
@@ -206,42 +246,6 @@ def analyze_asl_video(video_bytes: bytes) -> dict:
         if keyframe_paths:
             try: os.rmdir(os.path.dirname(keyframe_paths[0]))
             except: pass
-
-
-# =============================================================
-# CLAUDE
-# =============================================================
-
-def analyze_with_claude(frame_paths: list, video_size: int) -> dict:
-    try:
-        prompt_text = ASL_PROMPT.format(num_frames=len(frame_paths))
-        content = []
-        for i, path in enumerate(frame_paths):
-            with open(path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-            content.append({"type": "text", "text": f"Frame {i+1} of {len(frame_paths)}"})
-            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}})
-        content.append({"type": "text", "text": prompt_text})
-
-        models = ["claude-3-5-sonnet-20241022", "claude-haiku-3-5-20241022"]
-        for model in models:
-            try:
-                print(f">>> Claude: trying {model}...")
-                resp = claude_client.messages.create(
-                    model=model, max_tokens=1024,
-                    messages=[{"role": "user", "content": content}]
-                )
-                print(f">>> Claude: success with {model}")
-                return parse_response(resp.content[0].text, f"claude/{model}", video_size, "claude-keyframes")
-            except anthropic.RateLimitError:
-                print(f">>> Claude: rate limited on {model}")
-                time.sleep(3)
-            except Exception as e:
-                print(f">>> Claude: {model} error: {e}")
-
-        return {"error": "Claude: all models failed"}
-    except Exception as e:
-        return {"error": f"Claude error: {e}"}
 
 
 # =============================================================
@@ -258,23 +262,29 @@ def analyze_with_gemini_keyframes(frame_paths: list, video_size: int) -> dict:
             parts.append(f"Frame {i+1} of {len(frame_paths)}")
             parts.append(gemini_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
 
+        # Valid Gemini models as of mid-2025
         models = [
             "gemini-2.5-flash",
             "gemini-2.0-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",  # reliable fallback
         ]
+
         for model in models:
             try:
-                print(f">>> Gemini: trying {model}...")
+                print(f">>> Gemini keyframes: trying {model}...")
                 resp = gemini_client.models.generate_content(model=model, contents=parts)
-                print(f">>> Gemini: success with {model}")
+                print(f">>> Gemini keyframes: success with {model}")
                 return parse_response(resp.text, f"gemini/{model}", video_size, "gemini-keyframes")
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    print(f">>> Gemini: rate limited on {model}, waiting 5s...")
-                    time.sleep(5)
+                    print(f">>> Gemini: rate limited on {model}, waiting 10s...")
+                    time.sleep(10)
+                elif "404" in err or "not found" in err.lower():
+                    print(f">>> Gemini: model {model} not found, trying next...")
+                elif "403" in err or "API_KEY" in err or "permission" in err.lower():
+                    print(f"!!! Gemini: AUTH ERROR — check GEMINI_API_KEY: {err}")
+                    return {"error": f"Gemini auth failed: {err}"}
                 else:
                     print(f">>> Gemini: {model} error: {err}")
 
@@ -284,7 +294,7 @@ def analyze_with_gemini_keyframes(frame_paths: list, video_size: int) -> dict:
 
 
 # =============================================================
-# GEMINI VIDEO (last resort)
+# GEMINI VIDEO UPLOAD (fallback)
 # =============================================================
 
 def analyze_with_gemini_video(video_path: str, video_size: int) -> dict:
@@ -293,7 +303,8 @@ def analyze_with_gemini_video(video_path: str, video_size: int) -> dict:
         uploaded = gemini_client.files.upload(file=video_path)
         waited = 0
         while uploaded.state.name == "PROCESSING":
-            time.sleep(2); waited += 2
+            time.sleep(2)
+            waited += 2
             if waited > 60:
                 return {"error": "Video processing timed out"}
             uploaded = gemini_client.files.get(name=uploaded.name)
@@ -301,17 +312,23 @@ def analyze_with_gemini_video(video_path: str, video_size: int) -> dict:
         if uploaded.state.name == "FAILED":
             return {"error": "Gemini failed to process video"}
 
-        for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
             try:
+                print(f">>> Gemini video: trying {model}...")
                 resp = gemini_client.models.generate_content(
                     model=model, contents=[uploaded, ASL_PROMPT_VIDEO]
                 )
                 try: gemini_client.files.delete(name=uploaded.name)
                 except: pass
+                print(f">>> Gemini video: success with {model}")
                 return parse_response(resp.text, f"gemini/{model}", video_size, "gemini-video")
             except Exception as e:
-                print(f">>> Gemini video {model} error: {e}")
-                time.sleep(3)
+                err = str(e)
+                print(f">>> Gemini video {model} error: {err}")
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    time.sleep(10)
+                elif "403" in err or "API_KEY" in err:
+                    return {"error": f"Gemini auth failed: {err}"}
 
         return {"error": "Gemini video: all models failed"}
     except Exception as e:
@@ -320,27 +337,24 @@ def analyze_with_gemini_video(video_path: str, video_size: int) -> dict:
 
 # =============================================================
 # RESPONSE PARSER
-# FIX: More robust parsing — handles multiline JSON, extra text,
-# markdown fences, and partial responses gracefully.
-# Never returns "UNKNOWN" when AI gave a real answer.
 # =============================================================
 
 def parse_response(result_text: str, used_model: str, video_size: int, method: str) -> dict:
     print(f">>> Raw response: {result_text[:300]}")
 
-    # Step 1: Strip markdown fences
+    # Strip markdown fences
     cleaned = re.sub(r'```(?:json)?', '', result_text).strip()
 
-    # Step 2: Try direct JSON parse first
     result = None
+
+    # Try direct JSON parse
     try:
         result = json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Step 3: Try extracting JSON object (handles extra text around it)
+    # Try extracting JSON object (handles extra text around it)
     if result is None:
-        # Remove newlines inside JSON to fix multiline format issue
         cleaned_single = re.sub(r'\s+', ' ', cleaned)
         match = re.search(r'\{.*\}', cleaned_single, re.DOTALL)
         if match:
@@ -349,10 +363,9 @@ def parse_response(result_text: str, used_model: str, video_size: int, method: s
             except json.JSONDecodeError:
                 pass
 
-    # Step 4: If still no valid JSON, try to extract prediction from plain text
+    # Try extracting prediction from plain text
     if result is None:
         print(f"!!! Could not parse JSON from: {result_text[:200]}")
-        # Try to find a word that looks like a sign name in the text
         word_match = re.search(r'"prediction"\s*:\s*"([A-Z]+)"', result_text)
         if word_match:
             result = {
